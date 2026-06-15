@@ -71,7 +71,10 @@ async function recordSketch(sketchUrl, durationMs = 60000) {
 
     // ── Navigate ──────────────────────────────────────────────────────────
     console.log('[recorder] Navigating to:', sketchUrl);
-    await page.goto(sketchUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+    const browseUrl = sketchUrl.includes('/raw/upload/')
+      ? sketchUrl.replace('/raw/upload/', '/raw/upload/fl_inline/')
+      : sketchUrl;
+    await page.goto(browseUrl, { waitUntil: 'networkidle2', timeout: 30000 });
     await sleep(2500); // let p5.js and sketch initialize fully
 
     // ── Click start overlay ───────────────────────────────────────────────
