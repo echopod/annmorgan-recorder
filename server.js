@@ -127,11 +127,16 @@ async function recordSketch(sketchUrl, durationMs) {
     await browser.close();
   }
 }
-async function uploadToCloudinary(filePath) {
+async function uploadToCloudinary(filePath, caption) {
   console.log('[cloudinary] Uploading:', path.basename(filePath));
   const form = new FormData();
   form.append('upload_preset', CLOUDINARY_PRESET);
   form.append('file', fs.createReadStream(filePath));
+  if (caption) {
+    var safeCaption = caption.replace(/\|/g, ' ').replace(/=/g, '-');
+    form.append('context', 'caption=' + safeCaption);
+    console.log('[cloudinary] Attaching caption as context metadata');
+  }
   const res = await fetch(
     'https://api.cloudinary.com/v1_1/' + CLOUDINARY_CLOUD + '/video/upload',
     { method: 'POST', body: form }
@@ -141,13 +146,13 @@ async function uploadToCloudinary(filePath) {
   console.log('[cloudinary] Uploaded:', data.secure_url);
   return data;
 }
-async function runJob(jobId, sketchUrl, durationMs) {
+async function runJob(jobId, sketchUrl, durationMs, caption) {
   var filePath = null;
   try {
     jobs.set(jobId, { status: 'recording', startedAt: new Date().toISOString() });
     filePath = await recordSketch(sketchUrl, durationMs);
     jobs.set(jobId, { status: 'uploading' });
-    const result = await uploadToCloudinary(filePath);
+    const result = await uploadToCloudinary(filePath, caption);
     jobs.set(jobId, {
       status: 'done',
       cloudinary_url: result.secure_url,
@@ -168,11 +173,12 @@ app.get('/health', function(_req, res) {
 app.post('/record', function(req, res) {
   const sketch_url = req.body.sketch_url;
   const duration_ms = req.body.duration_ms || 60000;
+  const caption = req.body.caption || '';
   if (!sketch_url) return res.status(400).json({ error: 'sketch_url is required' });
   const jobId = 'job-' + Date.now();
   jobs.set(jobId, { status: 'queued', sketch_url: sketch_url });
   console.log('[/record] Queued ' + jobId + ': ' + sketch_url);
-  runJob(jobId, sketch_url, duration_ms);
+  runJob(jobId, sketch_url, duration_ms, caption);
   res.json({ status: 'recording_started', job_id: jobId });
 });
 app.get('/status/:id', function(req, res) {
