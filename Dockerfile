@@ -39,7 +39,7 @@ WORKDIR /app
 
 # Install dependencies (Puppeteer downloads Chromium here — ~300MB, baked into image)
 COPY package*.json ./
-RUN npm ci
+RUN npm install
 
 # Copy app code
 COPY server.js .
