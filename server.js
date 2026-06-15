@@ -12,11 +12,14 @@ const CLOUDINARY_CLOUD = process.env.CLOUDINARY_CLOUD_NAME || 'dpdr82xba';
 const CLOUDINARY_PRESET = process.env.CLOUDINARY_UPLOAD_PRESET || 'agent-drops';
 const jobs = new Map();
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-async function recordSketch(sketchUrl, durationMs = 60000) {
+async function recordSketch(sketchUrl, durationMs) {
+  if (!durationMs) durationMs = 60000;
+  console.log('[recorder] Fetching sketch HTML from:', sketchUrl);
+  const htmlRes = await fetch(sketchUrl);
+  if (!htmlRes.ok) throw new Error('Failed to fetch sketch: ' + htmlRes.status);
+  const htmlContent = await htmlRes.text();
+  console.log('[recorder] Got HTML, length:', htmlContent.length);
   console.log('[recorder] Launching browser...');
-  const browseUrl = sketchUrl.includes('/raw/upload/')
-    ? sketchUrl.replace('/raw/upload/', '/raw/upload/fl_inline/')
-    : sketchUrl;
   const browser = await puppeteer.launch({
     headless: true,
     args: [
@@ -27,38 +30,40 @@ async function recordSketch(sketchUrl, durationMs = 60000) {
       '--window-size=1080,1920',
     ],
   });
-  let downloadTimer = null;
   try {
     const page = await browser.newPage();
     await page.setViewport({ width: 1080, height: 1920, deviceScaleFactor: 1 });
-    const cdp = await page.createCDPSession();
-    await cdp.send('Browser.setDownloadBehavior', {
-      behavior: 'allow',
-      downloadPath: '/tmp',
-      eventsEnabled: true,
+    var recordingResolve;
+    var recordingReject;
+    var recordingTimeout;
+    const recordingDone = new Promise(function(resolve, reject) {
+      recordingResolve = resolve;
+      recordingReject = reject;
     });
-    const downloadDone = new Promise((resolve, reject) => {
-      downloadTimer = setTimeout(
-        () => reject(new Error('Download timeout')),
-        durationMs + 40000
-      );
-      cdp.on('Browser.downloadProgress', (evt) => {
-        if (evt.state === 'completed') {
-          clearTimeout(downloadTimer);
-          downloadTimer = null;
-          resolve(path.join('/tmp', evt.suggestedFilename || 'recording.webm'));
-        } else if (evt.state === 'cancelled') {
-          clearTimeout(downloadTimer);
-          downloadTimer = null;
-          reject(new Error('Browser cancelled the download'));
-        }
-      });
+    recordingTimeout = setTimeout(function() {
+      recordingReject(new Error('Recording timeout after ' + (durationMs + 30000) / 1000 + 's'));
+    }, durationMs + 30000);
+    const filePath = '/tmp/annmorgan-' + Date.now() + '.webm';
+    await page.exposeFunction('__recordingComplete', function(base64Data) {
+      try {
+        clearTimeout(recordingTimeout);
+        console.log('[recorder] Received recording data, writing to disk...');
+        const buffer = Buffer.from(base64Data, 'base64');
+        fs.writeFileSync(filePath, buffer);
+        console.log('[recorder] File saved:', filePath, '(' + buffer.length + ' bytes)');
+        recordingResolve(filePath);
+      } catch(e) {
+        recordingReject(new Error('Failed to write file: ' + e.message));
+      }
     });
-    downloadDone.catch(() => {});
-    console.log('[recorder] Navigating to:', browseUrl);
-    await page.goto(browseUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+    await page.exposeFunction('__recordingError', function(msg) {
+      clearTimeout(recordingTimeout);
+      recordingReject(new Error('Page error: ' + msg));
+    });
+    console.log('[recorder] Loading HTML into page...');
+    await page.setContent(htmlContent, { waitUntil: 'networkidle2', timeout: 30000 });
     await sleep(2500);
-    const clickResult = await page.evaluate(() => {
+    const clickResult = await page.evaluate(function() {
       const overlay = document.getElementById('startOverlay');
       if (overlay) { overlay.click(); return 'overlay'; }
       const canvas = document.querySelector('canvas');
@@ -70,11 +75,11 @@ async function recordSketch(sketchUrl, durationMs = 60000) {
     });
     console.log('[recorder] Click result:', clickResult);
     await sleep(1500);
-    await page.evaluate((ms) => {
+    await page.evaluate(function(ms) {
       const canvas = document.querySelector('canvas');
-      if (!canvas) { console.error('[page] No canvas found'); return; }
+      if (!canvas) { window.__recordingError('No canvas found'); return; }
       const videoStream = canvas.captureStream(30);
-      let combinedStream = videoStream;
+      var combinedStream = videoStream;
       if (window.__audioStream && window.__audioStream.getAudioTracks().length > 0) {
         combinedStream = new MediaStream([
           ...videoStream.getVideoTracks(),
@@ -88,34 +93,37 @@ async function recordSketch(sketchUrl, durationMs = 60000) {
         'video/webm; codecs=vp9,opus',
         'video/webm; codecs=vp8,opus',
         'video/webm',
-      ].find(t => MediaRecorder.isTypeSupported(t)) || 'video/webm';
+      ].find(function(t) { return MediaRecorder.isTypeSupported(t); }) || 'video/webm';
       console.log('[page] mimeType:', mimeType);
       const chunks = [];
-      const rec = new MediaRecorder(combinedStream, { mimeType, videoBitsPerSecond: 2500000 });
-      rec.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
-      rec.onstop = () => {
+      const rec = new MediaRecorder(combinedStream, { mimeType: mimeType, videoBitsPerSecond: 2500000 });
+      rec.ondataavailable = function(e) { if (e.data && e.data.size > 0) chunks.push(e.data); };
+      rec.onstop = function() {
+        console.log('[page] Recording stopped, building blob...');
         const blob = new Blob(chunks, { type: 'video/webm' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.style.display = 'none';
-        a.href = url;
-        a.download = 'annmorgan-recording.webm';
-        document.body.appendChild(a);
-        a.click();
-        setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 2000);
-        console.log('[page] Download triggered, size:', blob.size, 'bytes');
+        console.log('[page] Blob size:', blob.size, 'bytes');
+        const reader = new FileReader();
+        reader.onloadend = function() {
+          try {
+            const base64 = reader.result.split(',')[1];
+            console.log('[page] Sending data to Node.js...');
+            window.__recordingComplete(base64);
+          } catch(e) {
+            window.__recordingError('base64 error: ' + e.message);
+          }
+        };
+        reader.onerror = function() { window.__recordingError('FileReader failed'); };
+        reader.readAsDataURL(blob);
       };
       rec.start(1000);
       window.__recorder = rec;
-      setTimeout(() => { if (rec.state !== 'inactive') rec.stop(); }, ms);
+      setTimeout(function() { if (rec.state !== 'inactive') rec.stop(); }, ms);
       console.log('[page] MediaRecorder started, duration:', ms / 1000, 's');
     }, durationMs);
     console.log('[recorder] Recording in progress...');
-    const filePath = await downloadDone;
-    console.log('[recorder] File saved:', filePath);
-    return filePath;
+    const savedPath = await recordingDone;
+    return savedPath;
   } finally {
-    if (downloadTimer) clearTimeout(downloadTimer);
     await browser.close();
   }
 }
@@ -134,7 +142,7 @@ async function uploadToCloudinary(filePath) {
   return data;
 }
 async function runJob(jobId, sketchUrl, durationMs) {
-  let filePath = null;
+  var filePath = null;
   try {
     jobs.set(jobId, { status: 'recording', startedAt: new Date().toISOString() });
     filePath = await recordSketch(sketchUrl, durationMs);
